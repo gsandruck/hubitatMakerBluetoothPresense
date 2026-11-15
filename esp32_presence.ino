@@ -43,6 +43,10 @@ bool beaconIsActive = true;
 bool lastCheckSucceeded = false;
 
 // Standard USB HID "boot keyboard" report descriptor (report ID 1).
+// This is boilerplate straight out of the USB HID spec's keyboard example -
+// we never actually send key reports, we just need a valid HID Keyboard
+// service so Android's OS-level Bluetooth stack recognizes and auto-reconnects
+// to this device the same way it would a real Bluetooth keyboard.
 static const uint8_t KEYBOARD_REPORT_MAP[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
@@ -71,7 +75,7 @@ static const uint8_t KEYBOARD_REPORT_MAP[] = {
 };
 
 // ==========================================
-// SERVER CALLBACKS
+// SERVER CALLBACKS (this is our presence signal)
 // ==========================================
 class PresenceServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
@@ -83,14 +87,12 @@ class PresenceServerCallbacks : public NimBLEServerCallbacks {
     void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
         bleConnected.store(false);
         Serial.printf("[BLE] Phone disconnected (reason=%d).\n", reason);
+        //pServer->startAdvertising();
     }
 };
 
-// Forward declaration
-void setupWebServer();
-
 // ==========================================
-// CONFIG MODE (Access Point for First Boot)
+// CONFIG MODE (Access Point & Web Server)
 // ==========================================
 void enterConfigMode() {
     Serial.println(F("\n[CONFIG MODE] Starting Access Point..."));
@@ -152,17 +154,22 @@ void enterConfigMode() {
 }
 
 // ==========================================
-// BLE BOND CLEANUP
+// RESET BUTTON (tiered: short press = clear bonds, long press = full wipe)
 // ==========================================
+// NimBLEDevice::deleteAllBonds() has a known upstream bug where it doesn't
+// reliably persist the deletion to NVS (it calls ble_store_clear(), which
+// can leave stale bond records behind). Deleting bonds one at a time by
+// address routes through ble_gap_unpair() instead, which flushes correctly.
 void clearAllBleBonds() {
     if (bleConnected.load() && pServer != nullptr) {
         Serial.println(F("[BLE] Phone is currently connected; disconnecting before unpairing..."));
         pServer->disconnect(activeConnHandle.load());
-        delay(500);
+        delay(500); // give the link time to actually drop before we try to unpair
     }
     NimBLEDevice::deleteAllBonds();
-    
+    // 2. Direct NVS Namespace Wipe (This catches the stubborn "ghost" bond)
     nvs_handle_t nvs_handle;
+    // NimBLE typically stores security/bond data in these namespaces:
     if (nvs_open("nimble_bond", NVS_READWRITE, &nvs_handle) == ESP_OK) {
         nvs_erase_all(nvs_handle);
         nvs_commit(nvs_handle);
@@ -170,6 +177,7 @@ void clearAllBleBonds() {
         Serial.println(F("[NVS] Cleared 'nimble_bond' namespace from flash."));
     }
     
+    // Some versions use "ble_config" or generic storage namespaces
     if (nvs_open("ble_config", NVS_READWRITE, &nvs_handle) == ESP_OK) {
         nvs_erase_all(nvs_handle);
         nvs_commit(nvs_handle);
@@ -177,6 +185,8 @@ void clearAllBleBonds() {
         Serial.println(F("[NVS] Cleared 'ble_config' namespace from flash."));
     }
 
+    
+   // 3. Force-start advertising so it's active before reboot or if we stay alive
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     if (pAdvertising) {
         pAdvertising->start();
@@ -185,103 +195,6 @@ void clearAllBleBonds() {
     Serial.printf("[BLE] Bonds remaining after clear: %d\n", NimBLEDevice::getNumBonds());
 }
 
-// ==========================================
-// RUNTIME WEB SERVER (Active on Wi-Fi)
-// ==========================================
-void setupWebServer() {
-// Dashboard & Settings Editor
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Open preferences inside the handler to read live values
-        preferences.begin("phone-tracker", true);
-        String currentSsid = preferences.getString("wifi_ssid", "");
-        String currentHubIp = preferences.getString("hub_ip", storedHubitatIp);
-        String currentHubAppId = preferences.getString("hub_app_id", storedHubAppId);
-        String currentHubToken = preferences.getString("hub_token", storedMakerToken);
-        String currentMakerId = preferences.getString("maker_id", storedMakerId);
-        uint32_t currentPin = preferences.getUInt("pair_pin", storedPin);
-        preferences.end();
-
-        String html = "<html><head><style>";
-        html += "body{font-family:Arial;margin:30px;background:#f4f4f9;}";
-        html += ".card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);max-width:500px;margin-bottom:20px;}";
-        html += "input{width:100%;padding:8px;margin:8px 0 16px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}";
-        html += ".btn{background:#007BFF;color:white;border:none;padding:10px 15px;cursor:pointer;font-size:16px;border-radius:4px;}";
-        html += ".btn:hover{background:#0056b3;}";
-        html += ".btn-danger{background:#DC3545;}";
-        html += ".btn-danger:hover{background:#A71D2A;}";
-        html += "</style></head><body>";
-        
-        html += "<h2>ESP32 Presence Tracker Management</h2>";
-        
-        // Status Card
-        html += "<div class='card'><h3>Status</h3>";
-        html += "<p><b>IP Address:</b> " + WiFi.localIP().toString() + "</p>";
-        html += "<p><b>Paired Bluetooth Bonds:</b> " + String(NimBLEDevice::getNumBonds()) + "</p>";
-        html += "<p><b>Presence State:</b> " + String(currentPresenceState ? "<span style='color:green'>PRESENT</span>" : "<span style='color:red'>NOT PRESENT</span>") + "</p>";
-        html += "<form action='/unpair' method='POST' onsubmit='return confirm(\"Are you sure you want to unpair all devices?\");'>";
-        html += "<input type='submit' class='btn btn-danger' value='Unpair / Clear Bluetooth Bonds'>";
-        html += "</form></div>";
-
-        // Settings Form Card
-        html += "<div class='card'><h3>Settings</h3>";
-        html += "<form action='/save' method='POST'>";
-        html += "<label>Tracker Name:</label><input type='text' name='tracker_name' value='" + storedTrackerName + "' required>";
-        html += "<label>Wi-Fi SSID:</label><input type='text' name='ssid' value='" + currentSsid + "' required>";
-        html += "<label>Wi-Fi Password (leave blank to keep current):</label><input type='password' name='password'>";
-        html += "<label>Hubitat Local IP:</label><input type='text' name='hub_ip' value='" + currentHubIp + "' required>";
-        html += "<label>Maker API App ID:</label><input type='text' name='hub_app_id' value='" + currentHubAppId + "' required>";
-        html += "<label>Hubitat Maker API Token:</label><input type='text' name='hub_token' value='" + currentHubToken + "' required>";
-        html += "<label>Maker Device ID:</label><input type='text' name='maker_id' value='" + currentMakerId + "' required>";
-        html += "<label>Pairing PIN:</label><input type='number' name='pin' value='" + String(currentPin) + "' required>";
-        html += "<input type='submit' class='btn' value='Save Settings & Reboot'>";
-        html += "</form></div>";
-
-        html += "</body></html>";
-        request->send(200, "text/html", html);
-    });
-
-    // Save Settings Endpoint
-    server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
-        String trackerName = request->getParam("tracker_name", true)->value();
-        String ssid = request->getParam("ssid", true)->value();
-        String pass = request->hasParam("password", true) ? request->getParam("password", true)->value() : "";
-        String hubIp = request->getParam("hub_ip", true)->value();
-        String hubAppId = request->getParam("hub_app_id", true)->value();
-        String hubToken = request->getParam("hub_token", true)->value();
-        String makerId = request->getParam("maker_id", true)->value();
-        String pinStr = request->getParam("pin", true)->value();
-
-        preferences.begin("phone-tracker", false);
-        preferences.putString("tracker_name", trackerName);
-        preferences.putString("wifi_ssid", ssid);
-        if (pass.length() > 0) {
-            preferences.putString("wifi_pass", pass);
-        }
-        preferences.putString("hub_ip", hubIp);
-        preferences.putString("hub_app_id", hubAppId);
-        preferences.putString("hub_token", hubToken);
-        preferences.putString("maker_id", makerId);
-        preferences.putUInt("pair_pin", pinStr.toInt());
-        preferences.end();
-
-        request->send(200, "text/plain", "Settings saved successfully! Rebooting...");
-        delay(1500);
-        ESP.restart();
-    });
-
-    // Unpair Endpoint
-    server.on("/unpair", HTTP_POST, [](AsyncWebServerRequest *request){
-        clearAllBleBonds();
-        request->send(200, "text/html", "<h3>All Bluetooth bonds cleared successfully!</h3><p><a href='/'>Back to Dashboard</a></p>");
-    });
-
-    server.begin();
-    Serial.println(F("[WEB SERVER] Started successfully on port 80."));
-}
-
-// ==========================================
-// PHYSICAL RESET BUTTON
-// ==========================================
 void checkPhysicalReset() {
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
         delay(50); // debounce
@@ -290,7 +203,7 @@ void checkPhysicalReset() {
             while (digitalRead(RESET_BUTTON_PIN) == LOW) {
                 delay(100);
             }
-            unsigned long pressDuration = millis() - pressStartTime; // Fixed missing '-'
+            unsigned long pressDuration = millis() - pressStartTime;
 
             if (pressDuration >= 3000) {
                 preferences.begin("phone-tracker", false);
@@ -311,7 +224,7 @@ void checkPhysicalReset() {
 }
 
 // ==========================================
-// Hubitat Dispatcher
+// Hubitat Maker API Dispatcher
 // ==========================================
 void updateHubitatPresence(bool isPresent) {
     if (storedHubitatIp.length() == 0 || storedMakerId.length() == 0) return;
@@ -336,15 +249,17 @@ void updateHubitatPresence(bool isPresent) {
 }
 
 // ==========================================
-// BLE HID SETUP
+// BLE HID keyboard setup (hand-rolled, NimBLE-Arduino 2.x only, no
+// third-party keyboard library, no unused Bluedroid/1.x compatibility paths)
 // ==========================================
 void setupPresenceBeacon() {
     String bleName = storedTrackerName;
-    if (bleName.length() > 15) bleName = bleName.substring(0, 15);
+    if (bleName.length() > 15) bleName = bleName.substring(0, 15); // keep advertising packet small/reliable
 
     NimBLEDevice::init(bleName.c_str());
     NimBLEDevice::setSecurityAuth(true, true, true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    //NimBLEDevice::setSecurityPasskey(storedPin);
 
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new PresenceServerCallbacks());
@@ -354,45 +269,21 @@ void setupPresenceBeacon() {
     hid->setPnp(0x02, 0x05ac, 0x820a, 0x0210);
     hid->setHidInfo(0x00, 0x01);
     hid->setReportMap((uint8_t *)KEYBOARD_REPORT_MAP, sizeof(KEYBOARD_REPORT_MAP));
-    hid->getInputReport(1);
+    hid->getInputReport(1); // creates the report-ID-1 characteristic; we never write to it
     hid->startServices();
 
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->setAppearance(HID_KEYBOARD);
     pAdvertising->addServiceUUID(hid->getHidService()->getUUID());
     pAdvertising->enableScanResponse(true);
-    pAdvertising->setName(bleName.c_str());
+   
+    pAdvertising->setName(bleName.c_str()); // Explicitly inject name into advertisement payload
+
     pAdvertising->start();
 
-    Serial.printf("[BLE] Advertising as HID keyboard, name='%s'.\n", bleName.c_str());
+    Serial.printf("[BLE] Advertising as HID keyboard, name='%s'. Pair from your phone's Bluetooth settings.\n", bleName.c_str());
 }
 
-// ==========================================
-// WIFI EVENT HANDLERS
-// ==========================================
-void onWiFiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
-    Serial.printf("Disconnected from Wi-Fi. Reason: %d\n", info.wifi_sta_disconnected.reason);
-    Serial.println("Attempting to reconnect from Preferences...");
-    
-    preferences.begin("phone-tracker", true);
-    String ssid = preferences.getString("wifi_ssid", "");
-    String pass = preferences.getString("wifi_pass", "");
-    preferences.end();
-    
-    if (ssid.length() > 0) {
-        WiFi.begin(ssid.c_str(), pass.c_str());
-    }
-}
-
-void onWiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
-    Serial.println("Connected to Wi-Fi successfully!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-}
-
-// ==========================================
-// SETUP
-// ==========================================
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000);
@@ -415,33 +306,26 @@ void setup() {
     if (wifiSsid.length() == 0 || storedHubitatIp.length() == 0 || storedMakerId.length() == 0) {
         enterConfigMode();
     }
-    
-    WiFi.onEvent(onWiFiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-    WiFi.onEvent(onWiFiConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
 
     Serial.printf("[WIFI] Connecting to SSID: %s\n", wifiSsid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 
     unsigned long wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) { // Fixed missing '-'
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
         delay(500);
         Serial.print(".");
     }
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WIFI] Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
-        setupWebServer(); // Start the management web server
     } else {
-        Serial.println(F("\n[WIFI ERROR] Failed to connect within timeout. Background reconnection will keep trying."));
+        Serial.println(F("\n[WIFI ERROR] Failed to connect within timeout. Proceeding anyway, but network calls may fail."));
     }
 
     setupPresenceBeacon();
 }
 
-// ==========================================
-// LOOP
-// ==========================================
 void loop() {
     checkPhysicalReset();
     unsigned long now = millis();
@@ -451,9 +335,10 @@ void loop() {
     if (connectedNow) {
         lastConnectedMillis = now;
         everConnectedSinceBoot = true;
-        lastCheckSucceeded = true;
+        lastCheckSucceeded = true; // We successfully saw the phone!
     }
 
+    // Determine current presence based on connection or active grace window (for Hubitat)
     bool present = connectedNow ||
                    (everConnectedSinceBoot && (now - lastConnectedMillis) <= DROPOUT_GRACE_MS);
 
@@ -462,6 +347,8 @@ void loop() {
     // ==========================================
     // RADIO CYCLE MANAGEMENT
     // ==========================================
+    // If we have no bonds, OR if our last periodic check failed to find the phone,
+    // we drop out of the sleep cycle and stay ON continuously!
     if (!hasBonds || !lastCheckSucceeded) {
         if (!beaconIsActive) {
             beaconIsActive = true;
@@ -471,22 +358,31 @@ void loop() {
         lastBeaconCycleTime = now; 
     } 
     else {
+        // ==========================================
+        // PRESENT & CHECK PASSED: Run power-saving cycle (5s ON, 55s OFF)
+        // ==========================================
         randomSeed(esp_random());
         if (connectedNow && pServer != nullptr) {
             pServer->disconnect(activeConnHandle.load());
         } 
 
         if (beaconIsActive && (now - lastBeaconCycleTime >= BEACON_ACTIVE_WINDOW_MS)) {
+            // Active window just closed. Did we successfully connect during this window?
+            // If `connectedNow` was never triggered during this 5-second window, mark the check as failed!
+            // (We check if a connection happened recently or check connection state)
+            
             beaconIsActive = false;
             lastBeaconCycleTime = now;
             NimBLEDevice::getAdvertising()->stop();
             beaconSleepWindowMs = random(60000, 120001);
             Serial.println(F("[BLE RADIO] Sleeping radio to save power & RF bandwidth."));
             
+            // If we didn't connect at all during that 5-second window, flag it as a missed check for the next cycle
             if (!connectedNow && (now - lastConnectedMillis > BEACON_ACTIVE_WINDOW_MS)) {
                 lastCheckSucceeded = false;
             }
         } 
+        //else if (!beaconIsActive && (now - lastBeaconCycleTime >= BEACON_SLEEP_WINDOW_MS)) {
         else if (!beaconIsActive && (now - lastBeaconCycleTime >= beaconSleepWindowMs)) {    
             beaconIsActive = true;
             lastBeaconCycleTime = now;
@@ -498,12 +394,14 @@ void loop() {
     // ==========================================
     // EVALUATION INTERVAL & HUBITAT DISPATCH
     // ==========================================
+    // Hubitat still uses the generous 90-second grace window so your smart home 
+    // automation doesn't flap if your phone misses a poll, but your radio gets instant vigilance!
     if (now - lastEvalTime >= EVALUATION_INTERVAL || lastEvalTime == 0) {
         lastEvalTime = now;
 
         if (present != currentPresenceState) {
             currentPresenceState = present;
-            Serial.printf("[PRESENCE CHANGED] State: %s\n5", present ? "PRESENT" : "NOT PRESENT");
+            Serial.printf("[PRESENCE CHANGED] State: %s\n", present ? "PRESENT" : "NOT PRESENT");
             updateHubitatPresence(currentPresenceState);
         }
     }
