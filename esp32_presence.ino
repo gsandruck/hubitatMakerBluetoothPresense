@@ -2,100 +2,95 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <atomic>
+#include <nvs_flash.h>
 
 // ==========================================
-// CONSTANTS & CONFIGURATION
+// CONFIG
 // ==========================================
-const int RESET_BUTTON_PIN = 9; 
-const unsigned long STATIC_DROPOUT_THRESHOLD = 60; // seconds
-const unsigned long EVALUATION_INTERVAL = 10000;   // 10 seconds
+const int RESET_BUTTON_PIN = 9;                 // active-LOW button to GND
+const int LED_PIN = 8;
+const unsigned long DROPOUT_GRACE_MS = 180000;    // keep reporting "present" for this long after a disconnect
+const unsigned long EVALUATION_INTERVAL = 10000; // how often we log/evaluate state
 
 Preferences preferences;
 AsyncWebServer server(80);
 
-// Dynamic runtime configuration variables
-String storedTrackerName = "ESP32 Secure Tracker";
+String storedTrackerName = "ESP32 Presence Tracker";
 String storedMakerId = "";
 String storedHubitatIp = "";
 String storedHubAppId = "1";
 String storedMakerToken = "";
 uint32_t storedPin = 123456;
 
-// Thread-safe flags and tracking variables
-std::atomic<bool> hasSavedKey{false};
-std::atomic<unsigned long> packetCounter{0};
+NimBLEHIDDevice *hid = nullptr;
+NimBLEServer *pServer = nullptr;
+std::atomic<bool> bleConnected{false};
+std::atomic<uint16_t> activeConnHandle{0};
 
-unsigned long lastCheckTime = 0;
-unsigned long lastSeenTime = 0;
-bool phoneEverSeen = false;
+unsigned long lastConnectedMillis = 0;
+bool everConnectedSinceBoot = false;
 bool currentPresenceState = false;
+unsigned long lastEvalTime = 0;
 
-// ==========================================
-// BLE SCAN CALLBACKS
-// ==========================================
-class MyScanCallbacks : public NimBLEScanCallbacks {
-    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-        int currentRssi = advertisedDevice->getRSSI();
-        
-        if (currentRssi <= -80) {
-            return;
-        }
+unsigned long lastBeaconCycleTime = 0;
+const unsigned long BEACON_ACTIVE_WINDOW_MS = 5000; // stay awake/advertising for 5 seconds
+unsigned long beaconSleepWindowMs = 60000;
+bool beaconIsActive = true;
+bool lastCheckSucceeded = false;
 
-        const std::vector<unsigned char>& rawData = advertisedDevice->getPayload();
-        if (rawData.empty()) {
-            return;
-        }
-
-        bool isGoogleTracker = (rawData.size() >= 4 && rawData[0] == 0x03 && rawData[1] == 0x03 && rawData[2] == 0x9f && rawData[3] == 0xfe);
-        bool isGooglePresence = (rawData.size() >= 4 && rawData[1] == 0x16 && rawData[2] == 0xf3 && rawData[3] == 0xfe);
-
-        bool isAppleDevice = false;
-        for (size_t i = 0; i < rawData.size() - 2; i++) {
-            if (rawData[i] == 0xff && rawData[i+1] == 0x4c && rawData[i+2] == 0x00) {
-                isAppleDevice = true;
-                break;
-            }
-            if (i == 0 && rawData[0] == 0x4c && rawData[1] == 0x00) {
-                isAppleDevice = true;
-                break;
-            }
-        }
-
-        if ((isGoogleTracker || isGooglePresence || isAppleDevice) && NimBLEDevice::getNumBonds() > 0) {
-            packetCounter++; 
-            lastSeenTime = millis();
-            phoneEverSeen = true;
-        }
-    }
+// Standard USB HID "boot keyboard" report descriptor (report ID 1).
+static const uint8_t KEYBOARD_REPORT_MAP[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, 0x01,       //   Report Id (1)
+    0x05, 0x07,       //   Usage Page (Key Codes)
+    0x19, 0xE0,       //   Usage Minimum (224)
+    0x29, 0xE7,       //   Usage Maximum (231)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x08,       //   Report Count (8)
+    0x81, 0x02,       //   Input (Data, Variable, Absolute) - modifier byte
+    0x95, 0x01,       //   Report Count (1)
+    0x75, 0x08,       //   Report Size (8)
+    0x81, 0x01,       //   Input (Constant) - reserved byte
+    0x95, 0x06,       //   Report Count (6)
+    0x75, 0x08,       //   Report Size (8)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x65,       //   Logical Maximum (101)
+    0x05, 0x07,       //   Usage Page (Key Codes)
+    0x19, 0x00,       //   Usage Minimum (0)
+    0x29, 0x65,       //   Usage Maximum (101)
+    0x81, 0x00,       //   Input (Data, Array) - key array (6 bytes)
+    0xC0              // End Collection
 };
 
 // ==========================================
 // SERVER CALLBACKS
 // ==========================================
-class MyServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-        Serial.println(F("\n[SECURE_CONNECT] Phone physically bound to GATT channel."));
+class PresenceServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+        bleConnected.store(true);
+        activeConnHandle.store(connInfo.getConnHandle());
+        Serial.println(F("[BLE] Phone connected."));
     }
 
-    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
-        if (connInfo.isEncrypted() || connInfo.isBonded()) {
-            preferences.begin("phone-tracker", false);
-            preferences.putBool("has_key", true);
-            preferences.end();
-            Serial.println(F("[BOND_SUCCESS] Keys locked into NVS Flash. Rebooting..."));
-            delay(3000);
-            ESP.restart();
-        } else {
-            Serial.println(F("[SECURITY ERROR] Authentication failed or connection not encrypted."));
-        }
+    void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
+        bleConnected.store(false);
+        Serial.printf("[BLE] Phone disconnected (reason=%d).\n", reason);
     }
 };
 
+// Forward declaration
+void setupWebServer();
+
 // ==========================================
-// CONFIG MODE (Access Point & Web Server)
+// CONFIG MODE (Access Point for First Boot)
 // ==========================================
 void enterConfigMode() {
     Serial.println(F("\n[CONFIG MODE] Starting Access Point..."));
@@ -103,7 +98,7 @@ void enterConfigMode() {
     WiFi.softAP("ESP32-Tracker-Setup");
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", 
+        request->send(200, "text/html",
             "<html><head><style>"
             "body{font-family:Arial;margin:30px;background:#f4f4f9;}"
             "h2{color:#333;}"
@@ -112,7 +107,7 @@ void enterConfigMode() {
             "input[type=submit]{background:#007BFF;color:white;border:none;cursor:pointer;font-size:16px;}"
             "input[type=submit]:hover{background:#0056b3;}"
             "</style></head><body>"
-            "<h2>ESP32 Tracker Configuration</h2>"
+            "<h2>ESP32 Presence Tracker Configuration</h2>"
             "<form action='/save' method='POST'>"
             "<label>Tracker Unique Name / Room:</label><input type='text' name='tracker_name' value='LivingRoomTracker' required>"
             "<label>Wi-Fi SSID:</label><input type='text' name='ssid' required>"
@@ -146,64 +141,184 @@ void enterConfigMode() {
         preferences.putString("maker_id", makerId);
         preferences.putUInt("pair_pin", pinStr.toInt());
         preferences.end();
-        
+
         request->send(200, "text/plain", "Configuration Saved Successfully! Rebooting device...");
         delay(1500);
         ESP.restart();
     });
 
     server.begin();
-    while (true) { delay(100); } 
+    while (true) { delay(100); }
 }
 
 // ==========================================
-// SYSTEM FUNCTIONS (Dual-Tier Reset Handler)
+// BLE BOND CLEANUP
+// ==========================================
+void clearAllBleBonds() {
+    if (bleConnected.load() && pServer != nullptr) {
+        Serial.println(F("[BLE] Phone is currently connected; disconnecting before unpairing..."));
+        pServer->disconnect(activeConnHandle.load());
+        delay(500);
+    }
+    NimBLEDevice::deleteAllBonds();
+    
+    nvs_handle_t nvs_handle;
+    if (nvs_open("nimble_bond", NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_erase_all(nvs_handle);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        Serial.println(F("[NVS] Cleared 'nimble_bond' namespace from flash."));
+    }
+    
+    if (nvs_open("ble_config", NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_erase_all(nvs_handle);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        Serial.println(F("[NVS] Cleared 'ble_config' namespace from flash."));
+    }
+
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    if (pAdvertising) {
+        pAdvertising->start();
+    }
+    delay(500);
+    Serial.printf("[BLE] Bonds remaining after clear: %d\n", NimBLEDevice::getNumBonds());
+}
+
+// ==========================================
+// RUNTIME WEB SERVER (Active on Wi-Fi)
+// ==========================================
+void setupWebServer() {
+// Dashboard & Settings Editor
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        // Open preferences inside the handler to read live values
+        preferences.begin("phone-tracker", true);
+        String currentSsid = preferences.getString("wifi_ssid", "");
+        String currentHubIp = preferences.getString("hub_ip", storedHubitatIp);
+        String currentHubAppId = preferences.getString("hub_app_id", storedHubAppId);
+        String currentHubToken = preferences.getString("hub_token", storedMakerToken);
+        String currentMakerId = preferences.getString("maker_id", storedMakerId);
+        uint32_t currentPin = preferences.getUInt("pair_pin", storedPin);
+        preferences.end();
+
+        String html = "<html><head><style>";
+        html += "body{font-family:Arial;margin:30px;background:#f4f4f9;}";
+        html += ".card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,0.1);max-width:500px;margin-bottom:20px;}";
+        html += "input{width:100%;padding:8px;margin:8px 0 16px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}";
+        html += ".btn{background:#007BFF;color:white;border:none;padding:10px 15px;cursor:pointer;font-size:16px;border-radius:4px;}";
+        html += ".btn:hover{background:#0056b3;}";
+        html += ".btn-danger{background:#DC3545;}";
+        html += ".btn-danger:hover{background:#A71D2A;}";
+        html += "</style></head><body>";
+        
+        html += "<h2>ESP32 Presence Tracker Management</h2>";
+        
+        // Status Card
+        html += "<div class='card'><h3>Status</h3>";
+        html += "<p><b>IP Address:</b> " + WiFi.localIP().toString() + "</p>";
+        html += "<p><b>Paired Bluetooth Bonds:</b> " + String(NimBLEDevice::getNumBonds()) + "</p>";
+        html += "<p><b>Presence State:</b> " + String(currentPresenceState ? "<span style='color:green'>PRESENT</span>" : "<span style='color:red'>NOT PRESENT</span>") + "</p>";
+        html += "<form action='/unpair' method='POST' onsubmit='return confirm(\"Are you sure you want to unpair all devices?\");'>";
+        html += "<input type='submit' class='btn btn-danger' value='Unpair / Clear Bluetooth Bonds'>";
+        html += "</form></div>";
+
+        // Settings Form Card
+        html += "<div class='card'><h3>Settings</h3>";
+        html += "<form action='/save' method='POST'>";
+        html += "<label>Tracker Name:</label><input type='text' name='tracker_name' value='" + storedTrackerName + "' required>";
+        html += "<label>Wi-Fi SSID:</label><input type='text' name='ssid' value='" + currentSsid + "' required>";
+        html += "<label>Wi-Fi Password (leave blank to keep current):</label><input type='password' name='password'>";
+        html += "<label>Hubitat Local IP:</label><input type='text' name='hub_ip' value='" + currentHubIp + "' required>";
+        html += "<label>Maker API App ID:</label><input type='text' name='hub_app_id' value='" + currentHubAppId + "' required>";
+        html += "<label>Hubitat Maker API Token:</label><input type='text' name='hub_token' value='" + currentHubToken + "' required>";
+        html += "<label>Maker Device ID:</label><input type='text' name='maker_id' value='" + currentMakerId + "' required>";
+        html += "<label>Pairing PIN:</label><input type='number' name='pin' value='" + String(currentPin) + "' required>";
+        html += "<input type='submit' class='btn' value='Save Settings & Reboot'>";
+        html += "</form></div>";
+
+        html += "</body></html>";
+        request->send(200, "text/html", html);
+    });
+
+    // Save Settings Endpoint
+    server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
+        String trackerName = request->getParam("tracker_name", true)->value();
+        String ssid = request->getParam("ssid", true)->value();
+        String pass = request->hasParam("password", true) ? request->getParam("password", true)->value() : "";
+        String hubIp = request->getParam("hub_ip", true)->value();
+        String hubAppId = request->getParam("hub_app_id", true)->value();
+        String hubToken = request->getParam("hub_token", true)->value();
+        String makerId = request->getParam("maker_id", true)->value();
+        String pinStr = request->getParam("pin", true)->value();
+
+        preferences.begin("phone-tracker", false);
+        preferences.putString("tracker_name", trackerName);
+        preferences.putString("wifi_ssid", ssid);
+        if (pass.length() > 0) {
+            preferences.putString("wifi_pass", pass);
+        }
+        preferences.putString("hub_ip", hubIp);
+        preferences.putString("hub_app_id", hubAppId);
+        preferences.putString("hub_token", hubToken);
+        preferences.putString("maker_id", makerId);
+        preferences.putUInt("pair_pin", pinStr.toInt());
+        preferences.end();
+
+        request->send(200, "text/plain", "Settings saved successfully! Rebooting...");
+        delay(1500);
+        ESP.restart();
+    });
+
+    // Unpair Endpoint
+    server.on("/unpair", HTTP_POST, [](AsyncWebServerRequest *request){
+        clearAllBleBonds();
+        request->send(200, "text/html", "<h3>All Bluetooth bonds cleared successfully!</h3><p><a href='/'>Back to Dashboard</a></p>");
+    });
+
+    server.begin();
+    Serial.println(F("[WEB SERVER] Started successfully on port 80."));
+}
+
+// ==========================================
+// PHYSICAL RESET BUTTON
 // ==========================================
 void checkPhysicalReset() {
-    // Assuming active-LOW button wiring (Button pressed connects pin to GND)
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        delay(50); // Debounce
+        delay(50); // debounce
         if (digitalRead(RESET_BUTTON_PIN) == LOW) {
             unsigned long pressStartTime = millis();
-            
-            // Wait while the user holds the button to measure hold duration
             while (digitalRead(RESET_BUTTON_PIN) == LOW) {
                 delay(100);
-                // Optional: Print progress or provide visual feedback here if desired
             }
-            
-            unsigned long pressDuration = millis() - pressStartTime;
+            unsigned long pressDuration = millis() - pressStartTime; // Fixed missing '-'
 
             if (pressDuration >= 3000) {
-                // Tier 2: Long Press (>= 3 seconds) -> Full Factory Reset (Wipes Config + Bonds)
                 preferences.begin("phone-tracker", false);
                 preferences.clear();
                 preferences.end();
-                NimBLEDevice::deleteAllBonds();
-                Serial.println(F("\n[FACTORY RESET] Full memory wipe. Rebooting into Config Portal..."));
-                delay(1000);
+                clearAllBleBonds();
+                Serial.println(F("\n[FACTORY RESET] Wiping config + bonds. Rebooting into Config Portal..."));
+                delay(1500);
                 ESP.restart();
             } else {
-                // Tier 1: Quick Press (< 3 seconds) -> Clear Bluetooth Bonds Only
-                preferences.begin("phone-tracker", false);
-                preferences.putBool("has_key", false);
-                preferences.end();
-                NimBLEDevice::deleteAllBonds();
-                Serial.println(F("\n[BLE RESET] Security bonds cleared. Rebooting into Pairing Mode..."));
-                delay(1000);
+                clearAllBleBonds();
+                Serial.println(F("\n[BLE RESET] Bonds cleared. Re-pair your phone as a Bluetooth keyboard device."));
+                delay(1500);
                 ESP.restart();
             }
         }
     }
 }
 
-// Hubitat Maker API Dispatcher
+// ==========================================
+// Hubitat Dispatcher
+// ==========================================
 void updateHubitatPresence(bool isPresent) {
     if (storedHubitatIp.length() == 0 || storedMakerId.length() == 0) return;
 
     if (WiFi.status() == WL_CONNECTED) {
         HTTPClient http;
-        String stateCommand = isPresent ? "arrived" : "departed"; 
+        String stateCommand = isPresent ? "arrived" : "departed";
         String url = "http://" + storedHubitatIp + "/apps/api/" + storedHubAppId + "/devices/" + storedMakerId + "/" + stateCommand + "?access_token=" + storedMakerToken;
 
         http.begin(url);
@@ -220,47 +335,74 @@ void updateHubitatPresence(bool isPresent) {
     }
 }
 
-void startExtractionMode() {
-    Serial.println(F("\n[STATUS] Launching Secure Pairing Environment..."));
-    WiFi.mode(WIFI_OFF);
-    
-    NimBLEDevice::init(storedTrackerName.c_str());
-    NimBLEDevice::setOwnAddrType(BLE_ADDR_PUBLIC); 
-    
-    NimBLEDevice::setSecurityAuth(true, true, true); 
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY); 
-    NimBLEDevice::setSecurityPasskey(storedPin);
-    NimBLEDevice::setSecurityInitKey(0x03); 
-    NimBLEDevice::setSecurityRespKey(0x03);
-    
-    NimBLEServer *pServer = NimBLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    
-    NimBLEService *pService = pServer->createService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
-    NimBLECharacteristic *pSecureChar = pService->createCharacteristic(
-        "beb5483e-36e1-4688-b7f5-ea07361b26a8",
-        NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN
-    );
-    pSecureChar->setValue("SECURE_TOKEN");
-    pService->start();
+// ==========================================
+// BLE HID SETUP
+// ==========================================
+void setupPresenceBeacon() {
+    String bleName = storedTrackerName;
+    if (bleName.length() > 15) bleName = bleName.substring(0, 15);
+
+    NimBLEDevice::init(bleName.c_str());
+    NimBLEDevice::setSecurityAuth(true, true, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new PresenceServerCallbacks());
+
+    hid = new NimBLEHIDDevice(pServer);
+    hid->setManufacturer("DIY Presence");
+    hid->setPnp(0x02, 0x05ac, 0x820a, 0x0210);
+    hid->setHidInfo(0x00, 0x01);
+    hid->setReportMap((uint8_t *)KEYBOARD_REPORT_MAP, sizeof(KEYBOARD_REPORT_MAP));
+    hid->getInputReport(1);
+    hid->startServices();
 
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-    pAdvertising->setName(storedTrackerName.c_str());
-    pAdvertising->addServiceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+    pAdvertising->setAppearance(HID_KEYBOARD);
+    pAdvertising->addServiceUUID(hid->getHidService()->getUUID());
     pAdvertising->enableScanResponse(true);
+    pAdvertising->setName(bleName.c_str());
     pAdvertising->start();
+
+    Serial.printf("[BLE] Advertising as HID keyboard, name='%s'.\n", bleName.c_str());
 }
 
+// ==========================================
+// WIFI EVENT HANDLERS
+// ==========================================
+void onWiFiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+    Serial.printf("Disconnected from Wi-Fi. Reason: %d\n", info.wifi_sta_disconnected.reason);
+    Serial.println("Attempting to reconnect from Preferences...");
+    
+    preferences.begin("phone-tracker", true);
+    String ssid = preferences.getString("wifi_ssid", "");
+    String pass = preferences.getString("wifi_pass", "");
+    preferences.end();
+    
+    if (ssid.length() > 0) {
+        WiFi.begin(ssid.c_str(), pass.c_str());
+    }
+}
+
+void onWiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+    Serial.println("Connected to Wi-Fi successfully!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+}
+
+// ==========================================
+// SETUP
+// ==========================================
 void setup() {
     Serial.begin(115200);
-    while (!Serial && millis() < 3000); 
+    while (!Serial && millis() < 3000);
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
-    
-    Serial.println(F("\n--- TELEMETRY ENGINE ONLINE ---"));
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    Serial.println(F("\n--- PRESENCE ENGINE ONLINE ---"));
 
     preferences.begin("phone-tracker", true);
-    bool keyStored = preferences.getBool("has_key", false);
-    storedTrackerName = preferences.getString("tracker_name", "ESP32 Secure Tracker");
+    storedTrackerName = preferences.getString("tracker_name", storedTrackerName);
     String wifiSsid = preferences.getString("wifi_ssid", "");
     String wifiPass = preferences.getString("wifi_pass", "");
     storedHubitatIp = preferences.getString("hub_ip", "");
@@ -268,108 +410,102 @@ void setup() {
     storedMakerToken = preferences.getString("hub_token", "");
     storedMakerId = preferences.getString("maker_id", "");
     storedPin = preferences.getUInt("pair_pin", 123456);
-    preferences.end(); 
-
-    hasSavedKey.store(keyStored);
+    preferences.end();
 
     if (wifiSsid.length() == 0 || storedHubitatIp.length() == 0 || storedMakerId.length() == 0) {
         enterConfigMode();
     }
+    
+    WiFi.onEvent(onWiFiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+    WiFi.onEvent(onWiFiConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
 
     Serial.printf("[WIFI] Connecting to SSID: %s\n", wifiSsid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-    
+
     unsigned long wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) { // Fixed missing '-'
         delay(500);
         Serial.print(".");
     }
-    
+
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WIFI] Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+        setupWebServer(); // Start the management web server
     } else {
-        Serial.println(F("\n[WIFI ERROR] Failed to connect within timeout. Proceeding anyway, but network calls may fail."));
+        Serial.println(F("\n[WIFI ERROR] Failed to connect within timeout. Background reconnection will keep trying."));
     }
 
-    if (!hasSavedKey.load()) {
-        startExtractionMode();
-    } else {
-        Serial.println(F("\n[STATUS] Launching Continuous Telemetry Engine..."));
-        NimBLEDevice::init("");
-        NimBLEDevice::setOwnAddrType(BLE_ADDR_PUBLIC);
-        
-        NimBLEDevice::setSecurityAuth(true, true, true);
-        NimBLEDevice::setSecurityInitKey(0x03);
-        NimBLEDevice::setSecurityRespKey(0x03);
-        
-        NimBLEScan* pNimBLEScan = NimBLEDevice::getScan();
-        pNimBLEScan->setScanCallbacks(new MyScanCallbacks(), false);
-        pNimBLEScan->setActiveScan(true);
-        pNimBLEScan->setInterval(97);
-        pNimBLEScan->setWindow(97);
-        
-        pNimBLEScan->start(0, false); 
-        Serial.println(F("[RUNNING] Interception array completely open."));
-    }
+    setupPresenceBeacon();
 }
 
+// ==========================================
+// LOOP
+// ==========================================
 void loop() {
     checkPhysicalReset();
-    if (!hasSavedKey.load()) { 
-        delay(10); 
-        return; 
+    unsigned long now = millis();
+    bool hasBonds = (NimBLEDevice::getNumBonds() > 0);
+    bool connectedNow = bleConnected.load();
+
+    if (connectedNow) {
+        lastConnectedMillis = now;
+        everConnectedSinceBoot = true;
+        lastCheckSucceeded = true;
     }
 
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastCheckTime >= EVALUATION_INTERVAL || lastCheckTime == 0) { 
-        lastCheckTime = currentMillis;
+    bool present = connectedNow ||
+                   (everConnectedSinceBoot && (now - lastConnectedMillis) <= DROPOUT_GRACE_MS);
 
-        Serial.println(F("\n========================================="));
-        Serial.println(F("       10-SECOND EVALUATION SUMMARY      "));
-        Serial.println(F("========================================="));
-        
-        Serial.printf("[DATABASE] Secure Authorized Bonds: %d\n", NimBLEDevice::getNumBonds());
-        Serial.printf("[RADIO HEALTH] Packets caught in last window: %lu\n", packetCounter.load());
-        
-        bool evaluatedPresenceThisWindow = false;
+    digitalWrite(LED_PIN, present ? HIGH : LOW);
 
-        if (!phoneEverSeen) {
-            Serial.println(F("[TIMING] Last Target Presence: NEVER SEEN SINCE BOOT"));
-        } else {
-            unsigned long timeDiffSeconds = (currentMillis - lastSeenTime) / 1000;
-            unsigned long minutes = timeDiffSeconds / 60;
-            unsigned long seconds = timeDiffSeconds % 60;
-            
-            Serial.printf("[TIMING] Last Target Presence: %lu min %lu sec ago\n", minutes, seconds);
-            Serial.printf("[CONFIG] Static Dropout Wall: %lu seconds\n", STATIC_DROPOUT_THRESHOLD);
-            
-            if (timeDiffSeconds <= STATIC_DROPOUT_THRESHOLD) {
-                evaluatedPresenceThisWindow = true;
-            }
+    // ==========================================
+    // RADIO CYCLE MANAGEMENT
+    // ==========================================
+    if (!hasBonds || !lastCheckSucceeded) {
+        if (!beaconIsActive) {
+            beaconIsActive = true;
+            NimBLEDevice::getAdvertising()->start();
+            Serial.println(F("[BLE] Check missed. Radio active / advertising continuously for instant re-detection."));
         }
+        lastBeaconCycleTime = now; 
+    } 
+    else {
+        randomSeed(esp_random());
+        if (connectedNow && pServer != nullptr) {
+            delay(5000);
+            pServer->disconnect(activeConnHandle.load());
+        } 
 
-        if (evaluatedPresenceThisWindow != currentPresenceState) {
-            currentPresenceState = evaluatedPresenceThisWindow;
+        if (beaconIsActive && (now - lastBeaconCycleTime >= BEACON_ACTIVE_WINDOW_MS)) {
+            beaconIsActive = false;
+            lastBeaconCycleTime = now;
+            NimBLEDevice::getAdvertising()->stop();
+            beaconSleepWindowMs = random(60000, 120001);
+            Serial.println(F("[BLE RADIO] Sleeping radio to save power & RF bandwidth."));
+            
+            if (!connectedNow && (now - lastConnectedMillis > BEACON_ACTIVE_WINDOW_MS)) {
+                lastCheckSucceeded = false;
+            }
+        } 
+        else if (!beaconIsActive && (now - lastBeaconCycleTime >= beaconSleepWindowMs)) {    
+            beaconIsActive = true;
+            lastBeaconCycleTime = now;
+            NimBLEDevice::getAdvertising()->start();
+            Serial.println(F("[BLE RADIO] Waking up radio for periodic presence check..."));
+        }
+    }
+
+    // ==========================================
+    // EVALUATION INTERVAL & HUBITAT DISPATCH
+    // ==========================================
+    if (now - lastEvalTime >= EVALUATION_INTERVAL || lastEvalTime == 0) {
+        lastEvalTime = now;
+
+        if (present != currentPresenceState) {
+            currentPresenceState = present;
+            Serial.printf("[PRESENCE CHANGED] State: %s\n5", present ? "PRESENT" : "NOT PRESENT");
             updateHubitatPresence(currentPresenceState);
         }
-
-        if (currentPresenceState) {
-            Serial.println(F(">>> STATE EVALUATION: TARGET PHONE DEBOUNCED AS [PRESENT] <<<"));
-        } else {
-            Serial.println(F(">>> STATE EVALUATION: TARGET PHONE DEBOUNCED AS [NOT PRESENT] <<<"));
-        }
-
-        NimBLEScan* pScan = NimBLEDevice::getScan();
-        if (pScan->isScanning() == false) {
-            Serial.println(F("[WARNING] BLE Background Task Stopped. Re-initializing engine..."));
-            pScan->stop();
-            pScan->clearResults();
-            pScan->start(0, false);
-            Serial.println(F("[RECOVERY] Background scanning channel forced online."));
-        }
-        
-        packetCounter.store(0); 
-        Serial.println(F("=========================================\n"));
     }
 }
