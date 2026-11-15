@@ -259,7 +259,7 @@ void setupPresenceBeacon() {
     NimBLEDevice::init(bleName.c_str());
     NimBLEDevice::setSecurityAuth(true, true, true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-    //NimBLEDevice::setSecurityPasskey(storedPin);
+    NimBLEDevice::setSecurityPasskey(storedPin);
 
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new PresenceServerCallbacks());
